@@ -27,6 +27,8 @@ from zipfile import ZipFile
 from billiard import SoftTimeLimitExceeded
 from celery import Celery, task
 
+import jwt
+
 # from celery.app import app_or_default
 
 app = Celery('worker')
@@ -83,6 +85,15 @@ def do_docker_pull(image_name, task_id, secret):
             'traceback': error.output,
             'metadata': error.returncode
         })
+
+def get_user_comet_api_key(user_id):
+    url = os.environ.get('SECRET_API_HOSTNAME')
+    secret = os.environ.get('SECRET_API_KEY')
+    r = requests.get(url, headers={'Authorization': jwt.encode({'user_id': user_id}, secret)})
+    logger.info('secret code fetch status' + str(r.status_code) + 'secret' + secret + 'user_id' + str(user_id) + url)
+    if r.status_code != 200:
+        return 'No_KEY'
+    return r.json()
 
 
 # def docker_get_size():
@@ -233,6 +244,8 @@ def run(task_id, task_args):
     """
     logger.info("Entering run task; task_id=%s, task_args=%s", task_id, task_args)
     # run_id = task_args['bundle_id']
+    user_id  = task_args['user_id']
+    comet_api_key =  get_user_comet_api_key(user_id)
     docker_image = docker_image_clean(task_args['docker_image'])
     bundle_url = task_args['bundle_url']
     ingestion_program_docker_image = docker_image_clean(task_args['ingestion_program_docker_image'])
@@ -404,7 +417,7 @@ def run(task_id, task_args):
         timed_out = False
         exit_code = None
         ingestion_program_exit_code = None
-        available_memory_mib = get_available_memory()
+        available_memory_mib = 60000 #todo:fix me #get_available_memory()
 
         logger.info("Available memory: {}MB".format(available_memory_mib))
 
@@ -497,6 +510,11 @@ def run(task_id, task_args):
                     '--memory', '{}MB'.format(available_memory_mib - 512),
                     # Don't buffer python output, so we don't lose any
                     '-e', 'PYTHONUNBUFFERED=1',
+                    '-e', 'COMET_API_KEY={0}'.format(comet_api_key),
+		    # Set shared memory
+		    '--shm-size=8G',
+		    # Set IPC
+		    '--ipc=host',
                     # Set current working directory
                     '-w', run_dir,
                     # Set container runtime
@@ -568,8 +586,12 @@ def run(task_id, task_args):
                     # Set aside 512m memory for the host
                     '--memory', '{}MB'.format(available_memory_mib - 512),
                     # Add the participants submission dir to PYTHONPATH
+		    '--shm-size=8G',
+		    # Set IPC
+		    '--ipc=host',
                     '-e', 'PYTHONPATH=$PYTHONPATH:{}'.format(join(run_dir, 'program')),
                     '-e', 'PYTHONUNBUFFERED=1',
+                    '-e', 'COMET_API_KEY={0}'.format(comet_api_key),
                     # Set current working directory to submission dir
                     '-w', run_dir,
                     # Set container runtime
