@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 import json
-import logging
 import os
 import uuid
 import logging
 import psutil
 import signal
 import math
-import re
 import shutil
 import socket
 import tempfile
@@ -19,8 +17,147 @@ from os.path import join, exists
 from subprocess import Popen, call
 from subprocess import CalledProcessError
 
-from . import  util
 from . import  docker_util
+from .docker_util import docker_image_clean
+from .util import put_blob, get_bundle, get_available_memory
+
+# def docker_get_size():
+#     return os.popen("docker system df | awk -v x=4 'FNR == 2 {print $x}'").read().strip()
+#
+#
+# def docker_prune():
+#     """Runs a prune on docker if our images take up more than what's defined in settings."""
+#     # May also use docker system df --format "{{.Size}}"
+#     image_size = docker_get_size()
+#     image_size_measurement = image_size[-2:]
+#     image_size = float(image_size[:-2])
+#
+#     if image_size > settings.DOCKER_MAX_SIZE_GB and image_size_measurement == "GB":
+#         logger.info("Pruning")
+#         os.system("docker system prune --force")
+
+
+def get_bundle(root_dir, relative_dir, url):
+    # get file name from /test.zip?signature=!@#a/df
+    url_without_params = url.split('?')[0]
+    file_name = url_without_params.split('/')[-1]
+    file_ext = os.path.splitext(file_name)[1]
+
+    logger.debug("get_bundle :: Getting %s from %s" % (file_name, url))
+-
+    # Save the bundle to a temp file
+    # file_download_path = os.path.join(root_dir, file_name)
+    bundle_file = tempfile.NamedTemporaryFile(prefix='tmp', suffix=file_ext, dir=root_dir, delete=False)
+
+    retries = 0
+    while retries < 3:
+        try:
+            urllib.urlretrieve(url, bundle_file.name)
+            break
+        except:
+            retries += 1
+
+    # Extracting files or grabbing extras
+    bundle_path = join(root_dir, relative_dir)
+    metadata_path = join(bundle_path, 'metadata')
+
+    if file_ext == '.zip':
+        logger.info("get_bundle :: Unzipping %s" % bundle_file.name)
+        # Unzip file to relative dir, if a zip
+        with ZipFile(bundle_file.file, 'r') as z:
+            z.extractall(bundle_path)
+
+        # check if we just unzipped something containing a folder and nothing else
+        metadata_folder = _find_only_folder_with_metadata(bundle_path)
+        if metadata_folder:
+            logger.info("get_bundle :: Found a submission with an extra folder, unpacking and moving up a directory")
+            # Make a temp dir and copy data there
+            temp_folder_name = join(root_dir, "%s%s" % (relative_dir, '_tmp'))
+            shutil.copytree(metadata_folder, temp_folder_name)
+
+            # Delete old dir, move copied data back
+            shutil.rmtree(bundle_path, ignore_errors=True)
+            shutil.move(temp_folder_name, bundle_path)
+
+        # any zips we see should be unzipped to a folder with the name of the file
+        for zip_file in glob(join(bundle_path, "*.zip")):
+            name_without_extension = os.path.splitext(zip_file)[0]
+            with ZipFile(join(bundle_path, zip_file), 'r') as z:
+                z.extractall(join(bundle_path, name_without_extension))
+    else:
+        # Otherwise we have some metadata type file, like run.txt containing other bundles to fetch.
+        os.mkdir(bundle_path)
+        shutil.copyfile(bundle_file.name, metadata_path)
+
+    os.chmod(bundle_path, 0o777)
+
+    # Check for metadata containing more bundles to fetch
+    metadata = None
+    if os.path.exists(metadata_path):
+        logger.info("get_bundle :: Fetching extra files specified in metadata for {}".format(metadata_path))
+        with open(metadata_path) as mf:
+            metadata = yaml.load(mf)
+
+    if isinstance(metadata, dict):
+        for (k, v) in metadata.items():
+            if k not in ("description", "command", "exitCode", "elapsedTime", "stdout", "stderr", "submitted-by", "submitted-at"):
+                if isinstance(v, str):
+                    logger.debug("get_bundle :: Fetching recursive bundle %s %s %s" % (bundle_path, k, v))
+                    # Here K is the relative directory and V is the url, like
+                    # input: http://test.com/goku?sas=123
+                    metadata[k] = get_bundle(bundle_path, k, v)
+    return metadata
+
+
+def _send_update(task_id, status, secret, virtual_host='/', extra=None):
+    """
+    Sends a status update about the running task.
+
+    id: The task ID.
+    status: The new status for the task. One of 'running', 'finished' or 'failed'.
+    """
+    task_args = {'status': status}
+    if extra:
+        task_args['extra'] = extra
+    logger.info("Updating task=%s status to %s", task_id, status)
+    with app.connection() as new_connection:
+        # We need to send on the main virtual host, not whatever host we're currently
+        # connected to.
+        new_connection.virtual_host = virtual_host
+        app.send_task(
+            'apps.web.tasks.update_submission',
+            args=(task_id, task_args, secret),
+            connection=new_connection,
+            queue="submission-updates",
+        )
+
+
+def put_blob(url, file_path):
+    logger.info("Putting blob %s in %s" % (file_path, url))
+    requests.put(
+        url,
+        data=open(file_path, 'rb'),
+        headers={
+            'x-ms-blob-type': 'BlockBlob',
+            'x-ms-version': '2018-03-28',
+        }
+    )
+
+
+class ExecutionTimeLimitExceeded(Exception):
+    pass
+
+
+def alarm_handler(signum, frame):
+    raise ExecutionTimeLimitExceeded
+
+
+@task(name="compute_worker_run")
+def run_wrapper(task_id, task_args):
+    try:
+        run(task_id, task_args)
+    except SoftTimeLimitExceeded:
+        _send_update(task_id, {'status': 'failed'}, task_args['secret'])
 
 
 def local_run(worker, task_id, task_args):
@@ -34,9 +171,9 @@ def local_run(worker, task_id, task_args):
     logger.setLevel(logging.INFO)
     logger.info("Entering run task; task_id=%s, task_args=%s", task_id, task_args)
     # run_id = task_args['bundle_id']
-    docker_image = docker_util.docker_image_clean(task_args['docker_image'])
+    docker_image = docker_image_clean(task_args['docker_image'])
     bundle_url = task_args['bundle_url']
-    ingestion_program_docker_image = docker_util.docker_image_clean(
+    ingestion_program_docker_image = docker_image_clean(
         task_args['ingestion_program_docker_image'])
     stdout_url = task_args['stdout_url']
     stderr_url = task_args['stderr_url']
@@ -57,7 +194,7 @@ def local_run(worker, task_id, task_args):
     docker_runtime = os.environ.get('DOCKER_RUNTIME', '')
 
     try:
-        docker_util.do_docker_pull(docker_image, task_id, secret)
+        do_docker_pull(docker_image, task_id, secret)
     except CalledProcessError as error:
         logger.info("Docker pull for image: {} returned a non-zero exit code!")
         worker._send_update(task_id, 'failed', secret, extra={
@@ -67,7 +204,7 @@ def local_run(worker, task_id, task_args):
 
     if not docker_image == ingestion_program_docker_image:
         # If the images are the same only do one
-        docker_util.do_docker_pull(ingestion_program_docker_image, task_id, secret)
+        do_docker_pull(ingestion_program_docker_image, task_id, secret)
 
     if is_predict_step:
         logger.info("Task is prediction.")
@@ -82,8 +219,7 @@ def local_run(worker, task_id, task_args):
 
         "processes_running_in_temp_dir": running_processes,
 
-        "beginning_virtual_memory_usage": json.dumps(
-            psutil.virtual_memory()._asdict()),
+        "beginning_virtual_memory_usage": json.dumps(psutil.virtual_memory()._asdict()),
         "beginning_swap_memory_usage": json.dumps(psutil.swap_memory()._asdict()),
         "beginning_cpu_usage": psutil.cpu_percent(interval=None),
 
@@ -120,14 +256,13 @@ def local_run(worker, task_id, task_args):
         logger.info("Fetching bundles...")
         start = time.time()
 
-        bundles = util.get_bundle(root_dir, 'run', bundle_url)
+        bundles = get_bundle(root_dir, 'run', bundle_url)
 
         # If we were passed hidden data, move it
         if is_predict_step:
             hidden_ref_original_location = join(run_dir, 'hidden_ref')
             if exists(hidden_ref_original_location):
-                logger.info(
-                    "Found reference data AND an ingestion program, hiding reference data for ingestion program to use.")
+                logger.info("Found reference data AND an ingestion program, hiding reference data for ingestion program to use.")
                 shutil.move(hidden_ref_original_location, temp_dir)
                 hidden_ref_dir = join(temp_dir, 'hidden_ref')
 
@@ -151,9 +286,8 @@ def local_run(worker, task_id, task_args):
         if 'ingestion_program' in bundles:
             ingestion_prog_info = bundles['ingestion_program']
             if not ingestion_prog_info:
-                raise Exception(
-                    "Ingestion program is missing metadata. Make sure the folder structure is "
-                    "appropriate (metadata not in a subdirectory).")
+                raise Exception("Ingestion program is missing metadata. Make sure the folder structure is "
+                                "appropriate (metadata not in a subdirectory).")
 
         logger.info("Ingestion program: {}".format(ingestion_prog_info))
 
@@ -209,15 +343,14 @@ def local_run(worker, task_id, task_args):
         ingestion_program_start_time = None
         ingestion_program_end_time = None
 
-        default_detailed_result_path = os.path.join(output_dir,
-                                                    'detailed_results.html')
+        default_detailed_result_path = os.path.join(output_dir, 'detailed_results.html')
 
         run_ingestion_program = False
 
         timed_out = False
         exit_code = None
         ingestion_program_exit_code = None
-        available_memory_mib = util.get_available_memory()
+        available_memory_mib = get_available_memory()
 
         logger.info("Available memory: {}MB".format(available_memory_mib))
 
@@ -251,31 +384,26 @@ def local_run(worker, task_id, task_args):
                 # We're in prediction so use an ingestion program to process the submission.
                 # Was an ingestion program provided?
                 if is_code_submission and ingestion_prog_info:
-                    logger.info(
-                        "Running organizer provided ingestion program and submission.")
+                    logger.info("Running organizer provided ingestion program and submission.")
                     # Run ingestion program, run submission
                     run_ingestion_program = True
                 elif is_code_submission:
-                    logger.info(
-                        "Running code submission like normal, no ingestion program provided.")
+                    logger.info("Running code submission like normal, no ingestion program provided.")
                 else:
                     # We didn't find an ingestion program, let's use the following simple one
                     # that just executes the submission and moves results
-                    logger.info(
-                        "No code submission, moving input directory to output.")
+                    logger.info("No code submission, moving input directory to output.")
                     # This isn't a code submission, it is already ready to score. Remove
                     # old output directory and replace it with this submission's contents.
                     logger.info("Removing output_dir: {}".format(output_dir))
                     os.rmdir(output_dir)
-                    logger.info(
-                        "Renaming submission_path: {} to old output_dir name {}".format(
+                    logger.info("Renaming submission_path: {} to old output_dir name {}".format(
                             submission_path, output_dir))
                     os.rename(submission_path, output_dir)
             else:
                 # During scoring we don't worry about sharing directories and such when using ingestion programs
                 if ingestion_prog_info:
-                    logger.info(
-                        "Running organizer provided ingestion program for scoring")
+                    logger.info("Running organizer provided ingestion program for scoring")
                     run_ingestion_program = True
 
             if detailed_results_url:
@@ -356,7 +484,7 @@ def local_run(worker, task_id, task_args):
                 ingestion_prog_cmd = ingestion_prog_info['command']
 
                 # ingestion_run_dir = join(run_dir, 'ingestion')
-                ingestion_prog_cmd = ingestion_prog_cmd \
+                ingestion_prog_cmd = ingestion_prog_cmd\
                     .replace("$program", join(run_dir, 'ingestion_program')) \
                     .replace("$ingestion_program", join(run_dir, 'ingestion_program')) \
                     .replace("$submission_program", join(run_dir, 'program')) \
@@ -388,8 +516,7 @@ def local_run(worker, task_id, task_args):
                     # Set aside 512m memory for the host
                     '--memory', '{}MB'.format(available_memory_mib - 512),
                     # Add the participants submission dir to PYTHONPATH
-                    '-e',
-                    'PYTHONPATH=$PYTHONPATH:{}'.format(join(run_dir, 'program')),
+                    '-e', 'PYTHONPATH=$PYTHONPATH:{}'.format(join(run_dir, 'program')),
                     '-e', 'PYTHONUNBUFFERED=1',
                     # Set current working directory to submission dir
                     '-w', run_dir,
@@ -400,9 +527,7 @@ def local_run(worker, task_id, task_args):
                 ]
                 ingestion_prog_cmd = ingestion_docker_cmd + ingestion_prog_cmd
 
-                logger.error(ingestion_prog_cmd)
-                logger.info("Invoking ingestion program: %s",
-                             " ".join(ingestion_prog_cmd))
+                logger.info("Invoking ingestion program: %s", " ".join(ingestion_prog_cmd))
                 ingestion_process = Popen(
                     ingestion_prog_cmd,
                     stdout=ingestion_stdout,
@@ -418,16 +543,14 @@ def local_run(worker, task_id, task_args):
             if evaluator_process or ingestion_process:
                 # Only if a program is running do these checks, otherwise infinite loop checking nothing!
                 time_difference = time.time() - startTime
-                signal.signal(signal.SIGALRM, util.alarm_handler)
-                signal.alarm(
-                    int(math.fabs(math.ceil(execution_time_limit - time_difference))))
+                signal.signal(signal.SIGALRM, alarm_handler)
+                signal.alarm(int(math.fabs(math.ceil(execution_time_limit - time_difference))))
 
                 logger.info("Checking process, exit_code = %s" % exit_code)
 
                 try:
                     # While either program is running and hasn't exited, continue polling
-                    while (evaluator_process and exit_code == None) or (
-                            ingestion_process and ingestion_program_exit_code == None):
+                    while (evaluator_process and exit_code == None) or (ingestion_process and ingestion_program_exit_code == None):
                         time.sleep(1)
 
                         if evaluator_process and exit_code is None:
@@ -437,7 +560,7 @@ def local_run(worker, task_id, task_args):
                             ingestion_program_exit_code = ingestion_process.poll()
                 except (ValueError, OSError):
                     pass  # tried to communicate with dead process
-                except util.ExecutionTimeLimitExceeded:
+                except ExecutionTimeLimitExceeded:
                     logger.info("Killed process for running too long!")
                     stderr.write("Execution time limit exceeded!")
 
@@ -448,8 +571,7 @@ def local_run(worker, task_id, task_args):
                     if ingestion_process:
                         ingestion_program_exit_code = -1
                         ingestion_process.kill()
-                        call(
-                            ['docker', 'kill', '{}'.format(ingestion_container_name)])
+                        call('docker', 'kill', '{}'.format(ingestion_container_name)])
                     if detailed_result_process:
                         detailed_result_process.kill()
 
@@ -460,8 +582,7 @@ def local_run(worker, task_id, task_args):
                 if evaluator_process:
                     logger.info("Exit Code regular process: %d", exit_code)
                 if ingestion_process:
-                    logger.info("Exit Code ingestion process: %d",
-                                 ingestion_program_exit_code)
+                    logger.info("Exit Code ingestion process: %d", ingestion_program_exit_code)
                     debug_metadata[
                         'ingestion_program_duration'] = time.time() - ingestion_program_start_time
 
@@ -507,29 +628,29 @@ def local_run(worker, task_id, task_args):
 
         logger.info("Saving output files")
 
-        util.put_blob(stdout_url, stdout_file)
-        util.put_blob(stderr_url, stderr_file)
+        put_blob(stdout_url, stdout_file)
+        put_blob(stderr_url, stderr_file)
 
         if run_ingestion_program:
             ingestion_stdout.close()
             ingestion_stderr.close()
-            util.put_blob(ingestion_program_output_url, ingestion_stdout_file)
-            util.put_blob(ingestion_program_stderr_url, ingestion_stderr_file)
+            put_blob(ingestion_program_output_url, ingestion_stdout_file)
+            put_blob(ingestion_program_stderr_url, ingestion_stderr_file)
 
         private_dir = join(output_dir, 'private')
         if os.path.exists(private_dir):
             logger.info("Packing private results...")
             private_output_file = join(root_dir, 'run', 'private_output.zip')
-            shutil.make_archive(os.path.splitext(private_output_file)[0], 'zip',
-                                output_dir)
-            util.put_blob(private_output_url, private_output_file)
+            shutil.make_archive(os.path.splitext(private_output_file)[0], 'zip', output_dir)
+            put_blob(private_output_url, private_output_file)
             shutil.rmtree(private_dir, ignore_errors=True)
 
         # Pack results and send them to Blob storage
         logger.info("Packing results...")
         output_file = join(root_dir, 'run', 'output.zip')
         shutil.make_archive(os.path.splitext(output_file)[0], 'zip', output_dir)
-        util.put_blob(output_url, output_file)
+        put_blob(output_url, output_file)
+
 
         if detailed_results_url:
             detailed_result_data = open(default_detailed_result_path).read()
@@ -549,16 +670,14 @@ def local_run(worker, task_id, task_args):
                             file_to_upload = os.path.join(root, file)
                             file_ext = os.path.splitext(file_to_upload)[1]
                             if file_ext.lower() == ".html":
-                                util.put_blob(detailed_results_url, file_to_upload)
+                                put_blob(detailed_results_url, file_to_upload)
                                 html_found = True
                     else:
                         break
 
         # Save extra metadata
-        debug_metadata["end_virtual_memory_usage"] = json.dumps(
-            psutil.virtual_memory()._asdict())
-        debug_metadata["end_swap_memory_usage"] = json.dumps(
-            psutil.swap_memory()._asdict())
+        debug_metadata["end_virtual_memory_usage"] = json.dumps(psutil.virtual_memory()._asdict())
+        debug_metadata["end_swap_memory_usage"] = json.dumps(psutil.swap_memory()._asdict())
         debug_metadata["end_cpu_usage"] = psutil.cpu_percent(interval=None)
 
         # check if timed out AFTER output files are written! If we exit sooner, no output is written
@@ -599,5 +718,4 @@ def local_run(worker, task_id, task_args):
             os.chdir(current_dir)
             shutil.rmtree(root_dir, ignore_errors=True)
         except:
-            logger.exception("Unable to clean-up local folder %s (task_id=%s)",
-                              root_dir, task_id)
+            logger.exception("Unable to clean-up local folder %s (task_id=%s)", root_dir, task_id)

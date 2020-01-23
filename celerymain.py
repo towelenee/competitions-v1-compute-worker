@@ -12,7 +12,6 @@ class CeleryWorker():
     def __init__(self, *args, **kwargs):
         self.app = Celery(*args, **kwargs)
         self.app.config_from_object('celeryconfig')
-        # main_host_app = Celery('aci_compute_worker', broker=os.environ.get('MAIN_BROKER_URL'))
 
     def _send_update(self, task_id, status, secret, virtual_host='/', extra=None):
         """

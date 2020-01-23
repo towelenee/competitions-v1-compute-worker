@@ -16,6 +16,9 @@ from . import util, docker_util, codalabworker_logger
 
 
 # Config Azure ACI worker
+from .docker_util import docker_image_clean
+from .util import put_blob
+
 resource_group_name = "ACI"
 aci_worker = ACIWorker(resource_group_name)
 afs_creds = get_afs_creds()
@@ -33,9 +36,9 @@ def aci_run(worker, task_id, task_args):
     """
     codalabworker_logger.info("Entering run task; task_id=%s, task_args=%s", task_id, task_args)
     # run_id = task_args['bundle_id']
-    docker_image = docker_util.docker_image_clean(task_args['docker_image'])
+    docker_image = docker_image_clean(task_args['docker_image'])
     bundle_url = task_args['bundle_url']
-    ingestion_program_docker_image = docker_util.docker_image_clean(
+    ingestion_program_docker_image = docker_image_clean(
         task_args['ingestion_program_docker_image'])
     stdout_url = task_args['stdout_url']
     stderr_url = task_args['stderr_url']
@@ -63,8 +66,7 @@ def aci_run(worker, task_id, task_args):
 
         "processes_running_in_temp_dir": running_processes,
 
-        "beginning_virtual_memory_usage": json.dumps(
-            psutil.virtual_memory()._asdict()),
+        "beginning_virtual_memory_usage": json.dumps(psutil.virtual_memory()._asdict()),
         "beginning_swap_memory_usage": json.dumps(psutil.swap_memory()._asdict()),
         "beginning_cpu_usage": psutil.cpu_percent(interval=None),
 
@@ -89,7 +91,7 @@ def aci_run(worker, task_id, task_args):
         # Fetch and stage the bundles
         start = time.time()
         codalabworker_logger.info("Fetching bundles...")
-        bundles = util.get_bundle(root_dir, 'run', bundle_url)
+        bundles = get_bundle(root_dir, 'run', bundle_url)
         # If we were passed hidden data, move it
         if is_predict_step:
             hidden_ref_original_location = os.path.join(run_dir, 'hidden_ref')
@@ -329,20 +331,18 @@ def aci_run(worker, task_id, task_args):
             private_output_file = os.path.join(root_dir, 'run', 'private_output.zip')
             shutil.make_archive(os.path.splitext(private_output_file)[0], 'zip',
                                 output_dir)
-            util.put_blob(private_output_url, private_output_file)
+            put_blob(private_output_url, private_output_file)
             shutil.rmtree(private_dir, ignore_errors=True)
 
         # Pack results and send them to Blob storage
         codalabworker_logger.info("Packing results...")
         output_file = os.path.join(root_dir, 'run', 'output.zip')
         shutil.make_archive(os.path.splitext(output_file)[0], 'zip', output_dir)
-        util.put_blob(output_url, output_file)
+        put_blob(output_url, output_file)
 
         # Save extra metadata
-        debug_metadata["end_virtual_memory_usage"] = json.dumps(
-            psutil.virtual_memory()._asdict())
-        debug_metadata["end_swap_memory_usage"] = json.dumps(
-            psutil.swap_memory()._asdict())
+        debug_metadata["end_virtual_memory_usage"] = json.dumps(psutil.virtual_memory()._asdict())
+        debug_metadata["end_swap_memory_usage"] = json.dumps(psutil.swap_memory()._asdict())
         debug_metadata["end_cpu_usage"] = psutil.cpu_percent(interval=None)
 
         # check if timed out AFTER output files are written! If we exit sooner, no output is written
@@ -384,5 +384,4 @@ def aci_run(worker, task_id, task_args):
             shutil.rmtree(root_dir, ignore_errors=True)
             codalabworker_logger.info(f"{root_dir} was cleaned")
         except:
-            codalabworker_logger.exception("Unable to clean-up local folder %s (task_id=%s)",
-                              root_dir, task_id)
+            codalabworker_logger.exception("Unable to clean-up local folder %s (task_id=%s)", root_dir, task_id)
